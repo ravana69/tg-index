@@ -1,4 +1,7 @@
 import logging
+from PIL import Image, ImageDraw, ImageFont
+import random
+import io
 
 from aiohttp import web
 import aiohttp_jinja2
@@ -7,7 +10,7 @@ from telethon.tl import types
 from telethon.tl.custom import Message
 
 from .util import get_file_name, get_human_size
-from .config import chat_id
+from .config import index_settings, chat_ids
 
 
 log = logging.getLogger(__name__)
@@ -19,8 +22,25 @@ class Views:
         self.client = client
     
 
+    @aiohttp_jinja2.template('home.html')
+    async def home(self, req):
+        if len(chat_ids) == 1:
+            raise web.HTTPFound(f"{chat_ids[0]['alias_id']}")
+        chats = []
+        for chat in chat_ids:
+            chats.append({
+                'id': chat['alias_id'],
+                'name': chat['title']
+            })
+        return {'chats':chats}
+
+
     @aiohttp_jinja2.template('index.html')
     async def index(self, req):
+        alias_id = req.rel_url.path.split('/')[1]
+        chat = [i for i in chat_ids if i['alias_id'] == alias_id][0]
+        chat_id = chat['chat_id']
+        chat_name = chat['title']
         log_msg = ''
         try:
             offset_val = int(req.query.get('page', '1'))
@@ -34,36 +54,46 @@ class Views:
         log_msg += f"search query: {search_query} | "
         offset_val = 0 if offset_val <=1 else offset_val-1
         try:
+            kwargs = {
+                'entity': chat_id,
+                'limit': 20,
+                'add_offset': 20*offset_val
+            }
             if search_query:
-                messages = (await self.client.get_messages(chat_id, search=search_query, limit=20, add_offset=20*offset_val)) or []
-            else:
-                messages = (await self.client.get_messages(chat_id, limit=20, add_offset=20*offset_val)) or []
+                kwargs.update({'search': search_query})
+            messages = (await self.client.get_messages(**kwargs)) or []
+            
         except:
             log.debug("failed to get messages", exc_info=True)
             messages = []
-        log_msg += f"found {len(messages)} results"
+        log_msg += f"found {len(messages)} results | "
         log.debug(log_msg)
         results = []
         for m in messages:
+            entry = None
             if m.file and not isinstance(m.media, types.MessageMediaWebPage):
                 entry = dict(
                     file_id=m.id,
                     media=True,
+                    thumbnail=req.rel_url.with_path(f"/{alias_id}/{m.id}/thumbnail"),
                     mime_type=m.file.mime_type,
-                    insight = get_file_name(m)[:55],
-                    date = m.date.isoformat(),
-                    size=get_human_size(m.file.size)
+                    insight = get_file_name(m)[:100],
+                    date = m.date,
+                    size=get_human_size(m.file.size),
+                    url=req.rel_url.with_path(f"/{alias_id}/{m.id}/view")
                 )
             elif m.message:
                 entry = dict(
                     file_id=m.id,
                     media=False,
                     mime_type='text/plain',
-                    insight = m.raw_text[:55],
-                    date = m.date.isoformat(),
-                    size=get_human_size(len(m.raw_text))
+                    insight = m.raw_text[:100],
+                    date = m.date,
+                    size=get_human_size(len(m.raw_text)),
+                    url=req.rel_url.with_path(f"/{alias_id}/{m.id}/view")
                 )
-            results.append(entry)
+            if entry:
+                results.append(entry)
         prev_page = False
         next_page = False
         if offset_val:
@@ -90,13 +120,23 @@ class Views:
             'cur_page' : offset_val+1,
             'next_page': next_page,
             'search': search_query,
+            'name' : chat['title'],
+            'logo': req.rel_url.with_path(f"/{alias_id}/logo"),
+            'title' : "Index of " + chat_name
         }
 
 
     @aiohttp_jinja2.template('info.html')
     async def info(self, req):
         file_id = int(req.match_info["id"])
-        message = await self.client.get_messages(entity=chat_id, ids=file_id)
+        alias_id = req.rel_url.path.split('/')[1]
+        chat = [i for i in chat_ids if i['alias_id'] == alias_id][0]
+        chat_id = chat['chat_id']
+        try:
+            message = await self.client.get_messages(entity=chat_id, ids=file_id)
+        except:
+            log.debug(f"Error in getting message {file_id} in {chat_id}", exc_info=True)
+            message = None
         if not message or not isinstance(message, Message):
             log.debug(f"no valid entry for {file_id} in {chat_id}")
             return {
@@ -104,6 +144,15 @@ class Views:
                 'reason' : "Entry you are looking for cannot be retrived!",
             }
         return_val = {}
+        reply_btns = []
+        if message.reply_markup:
+            if isinstance(message.reply_markup, types.ReplyInlineMarkup):
+                for button_row in message.reply_markup.rows:
+                    btns = []
+                    for button in button_row.buttons:
+                        if isinstance(button, types.KeyboardButtonUrl):
+                            btns.append({'url': button.url, 'text': button.text})
+                    reply_btns.append(btns)
         if message.file and not isinstance(message.media, types.MessageMediaWebPage):
             file_name = get_file_name(message)
             file_size = get_human_size(message.file.size)
@@ -131,7 +180,8 @@ class Views:
                 'size': file_size,
                 'media': media,
                 'caption': caption,
-                'title': f"Download | {file_name} | {file_size}" 
+                'title': f"Download | {file_name} | {file_size}",
+                'reply_btns': reply_btns
             }
         elif message.message:
             text = Markup.escape(message.raw_text).__str__().replace('\n', '<br>')
@@ -139,16 +189,61 @@ class Views:
                 'found': True,
                 'media': False,
                 'text': text,
+                'reply_btns': reply_btns
             }
         else:
             return_val = {
                 'found':False,
                 'reason' : "Some kind of entry that I cannot display",
             }
-        
+        #return_val.update({'reply_btns': reply_btns})
         log.debug(f"data for {file_id} in {chat_id} returned as {return_val}")
         return return_val
+    
+
+    async def logo(self, req):
+        alias_id = req.rel_url.path.split('/')[1]
+        chat = [i for i in chat_ids if i['alias_id'] == alias_id][0]
+        chat_id = chat['chat_id']
+        chat_name = "Image not available"
+        try:
+            photo = await self.client.get_profile_photos(chat_id)
+        except:
+            log.debug(f"Error in getting profile picture in {chat_id}", exc_info=True)
+            photo = None
+        if not photo:
+            W, H = (160, 160) if req.query.get('big', None) else (80, 80)
+            c = lambda : random.randint(0, 255)
+            color = tuple([c() for i in range(3)])
+            im = Image.new("RGB", (W,H), color)
+            draw = ImageDraw.Draw(im)
+            w, h = draw.textsize(chat_name)
+            draw.text(((W-w)/2,(H-h)/2), chat_name, fill="white")
+            temp = io.BytesIO()
+            im.save(temp, "PNG")
+            body = temp.getvalue()
+        else:
+            photo = photo[0]
+            pos = -1 if req.query.get('big', None) else int(len(photo.sizes)/2)
+            size = self.client._get_thumb(photo.sizes, pos)
+            if isinstance(size, (types.PhotoCachedSize, types.PhotoStrippedSize)):
+                body = self.client._download_cached_photo_size(size, bytes)
+            else:
+                media = types.InputPhotoFileLocation(
+                    id=photo.id,
+                    access_hash=photo.access_hash,
+                    file_reference=photo.file_reference,
+                    thumb_size=size.type
+                )
+                body = self.client.iter_download(media)
         
+        r = web.Response(
+            status=200,
+            body=body,
+        )
+        #r.enable_chunked_encoding()
+        return r
+    
     
     async def download_get(self, req):
         return await self.handle_request(req)
@@ -159,41 +254,82 @@ class Views:
     
     
     async def thumbnail_get(self, req):
-        return await self.handle_request(req, thumb=True)
-    
-
-    async def thumbnail_head(self, req):
-        return await self.handle_request(req, head=True, thumb=True)
-
-
-    async def handle_request(self, req, head=False, thumb=False):
         file_id = int(req.match_info["id"])
+        alias_id = req.rel_url.path.split('/')[1]
+        chat = [i for i in chat_ids if i['alias_id'] == alias_id][0]
+        chat_id = chat['chat_id']
+        try:
+            message = await self.client.get_messages(entity=chat_id, ids=file_id)
+        except:
+            log.debug(f"Error in getting message {file_id} in {chat_id}", exc_info=True)
+            message = None
         
-        message = await self.client.get_messages(entity=chat_id, ids=file_id)
         if not message or not message.file:
-            log.info(f"no result for {file_id} in {chat_id}")
+            log.debug(f"no result for {file_id} in {chat_id}")
             return web.Response(status=410, text="410: Gone. Access to the target resource is no longer available!")
         
-        if thumb and message.document:
-            thumbnail = message.document.thumbs
-            if not thumbnail:
-                log.info(f"no thumbnail for {file_id} in {chat_id}")
-                return web.Response(status=404, text="404: Not Found")
-            thumbnail = thumbnail[-1]
-            mime_type = 'image/jpeg'
-            size = thumbnail.size
-            file_name = f"{file_id}_thumbnail.jpg"
-            media = types.InputDocumentFileLocation(
-                id=message.document.id,
-                access_hash=message.document.access_hash,
-                file_reference=message.document.file_reference,
-                thumb_size=thumbnail.type
-            )
+        if message.document:
+            media = message.document
+            thumbnails = media.thumbs
+            location = types.InputDocumentFileLocation
         else:
-            media = message.media
-            size = message.file.size
-            file_name = get_file_name(message)
-            mime_type = message.file.mime_type
+            media = message.photo
+            thumbnails = media.sizes
+            location = types.InputPhotoFileLocation
+        
+        if not thumbnails:
+            c = lambda : random.randint(0, 255)
+            color = tuple([c() for i in range(3)])
+            im = Image.new("RGB", (100, 100), color)
+            temp = io.BytesIO()
+            im.save(temp, "PNG")
+            body = temp.getvalue()
+        else:
+            thumb_pos = int(len(thumbnails)/2)
+            thumbnail = self.client._get_thumb(thumbnails, thumb_pos)
+            if not thumbnail or isinstance(thumbnail, types.PhotoSizeEmpty):
+                return web.Response(status=410, text="410: Gone. Access to the target resource is no longer available!")
+            
+            if isinstance(thumbnail, (types.PhotoCachedSize, types.PhotoStrippedSize)):
+                body = self.client._download_cached_photo_size(thumbnail, bytes)
+            else:
+                actual_file = location(
+                    id=media.id,
+                    access_hash=media.access_hash,
+                    file_reference=media.file_reference,
+                    thumb_size=thumbnail.type
+                )
+            
+                body = self.client.iter_download(actual_file)
+        
+        r = web.Response(
+            status=200,
+            body=body,
+        )
+        r.enable_chunked_encoding()
+        return r
+    
+
+    async def handle_request(self, req, head=False):
+        file_id = int(req.match_info["id"])
+        alias_id = req.rel_url.path.split('/')[1]
+        chat = [i for i in chat_ids if i['alias_id'] == alias_id][0]
+        chat_id = chat['chat_id']
+        
+        try:
+            message = await self.client.get_messages(entity=chat_id, ids=file_id)
+        except:
+            log.debug(f"Error in getting message {file_id} in {chat_id}", exc_info=True)
+            message = None
+        
+        if not message or not message.file:
+            log.debug(f"no result for {file_id} in {chat_id}")
+            return web.Response(status=410, text="410: Gone. Access to the target resource is no longer available!")
+        
+        media = message.media
+        size = message.file.size
+        file_name = get_file_name(message)
+        mime_type = message.file.mime_type
         
         try:
             offset = req.http_range.start or 0
@@ -201,7 +337,6 @@ class Views:
             if (limit > size) or (offset < 0) or (limit < offset):
                 raise ValueError("range not in acceptable format")
         except ValueError:
-            log.info("Range Not Satisfiable", exc_info=True)
             return web.Response(
                 status=416,
                 text="416: Range Not Satisfiable",
@@ -212,7 +347,7 @@ class Views:
         
         if not head:
             body = self.client.download(media, size, offset, limit)
-            log.info(f"Serving file {message.id} in {chat_id} ; Range: {offset} - {limit}")
+            log.info(f"Serving file in {message.id} (chat {chat_id}) ; Range: {offset} - {limit}")
         else:
             body = None
         
