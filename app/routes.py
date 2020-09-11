@@ -30,7 +30,8 @@ async def setup_routes(app, handler):
     h = handler
     client = h.client
     routes =  [
-        web.get('/', h.home, name='home')
+        web.get('/', h.home),
+        web.get('/api', h.api_home),
     ]
     index_all = index_settings['index_all']
     index_private = index_settings['index_private']
@@ -57,11 +58,14 @@ async def setup_routes(app, handler):
             if not alias_id:
                 continue
             
-            p = f"/{alias_id}"
+            p = r"/{chat:" + alias_id + "}"
+            p_api = '/api' + p
             r = [
                 web.get(p, h.index),
+                web.get(p_api, h.api_index),
                 web.get(p + r"/logo", h.logo),
                 web.get(p + r"/{id:\d+}/view", h.info),
+                web.get(p_api + r"/{id:\d+}/view", h.api_info),
                 web.get(p + r"/{id:\d+}/download", h.download_get),
                 web.head(p + r"/{id:\d+}/download", h.download_head),
                 web.get(p + r"/{id:\d+}/thumbnail", h.thumbnail_get),
@@ -72,15 +76,19 @@ async def setup_routes(app, handler):
         for chat_id in include_chats:
             chat = await client.get_entity(chat_id)
             alias_id = generate_alias_id(chat)
-            p = f"/{alias_id}"
+            p = r"/{chat:" + alias_id + "}"
+            p_api = '/api' + p
             r = [
                 web.get(p, h.index),
+                web.get(p_api, h.api_index),
                 web.get(p + r"/logo", h.logo),
                 web.get(p + r"/{id:\d+}/view", h.info),
+                web.get(p_api + r"/{id:\d+}/view", h.api_info),
                 web.get(p + r"/{id:\d+}/download", h.download_get),
                 web.head(p + r"/{id:\d+}/download", h.download_head),
                 web.get(p + r"/{id:\d+}/thumbnail", h.thumbnail_get),
             ]
             routes += r
             log.debug(f"Index added for {chat.id} :: {chat.title} at /{alias_id}")
+    routes.append(web.view(r'/{wildcard:.*}', h.wildcard))
     app.add_routes(routes)
